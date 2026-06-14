@@ -97,30 +97,65 @@ def get_best_move(board_state):
     best_move = (7, 7)
     directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
 
-    # 🗡️ 必杀
+    # ==========================================
+    # 🗡️ 第一段：自己能连成 5 子，瞬间绝杀！
+    # ==========================================
     for r in range(15):
         for c in range(15):
             if board_state[r, c] == 0:
                 for dr, dc in directions:
-                    if evaluate_line(board_state, r, c, dr, dc, 2) >= 100000: return (r, c)
-    # 🛡️ 死堵
+                    if evaluate_line(board_state, r, c, dr, dc, 2) >= 100000:
+                        return (r, c)
+
+    # ==========================================
+    # 🛡️ 第二段：人类能连成 5 子，必须死堵！
+    # ==========================================
     for r in range(15):
         for c in range(15):
             if board_state[r, c] == 0:
                 for dr, dc in directions:
-                    if evaluate_line(board_state, r, c, dr, dc, 1) >= 10000: return (r, c)
-    # ⚖️ 常规
+                    if evaluate_line(board_state, r, c, dr, dc, 1) >= 100000:
+                        return (r, c)
+
+    # ==========================================
+    # 🗡️ 第三段：自己能造出“活四”，下回合必赢，果断进攻！(修复的就是这里)
+    # ==========================================
+    for r in range(15):
+        for c in range(15):
+            if board_state[r, c] == 0:
+                for dr, dc in directions:
+                    if evaluate_line(board_state, r, c, dr, dc, 2) >= 10000:
+                        return (r, c)
+
+    # ==========================================
+    # 🛡️ 第四段：人类能造出“活四”，死堵！
+    # ==========================================
+    for r in range(15):
+        for c in range(15):
+            if board_state[r, c] == 0:
+                for dr, dc in directions:
+                    if evaluate_line(board_state, r, c, dr, dc, 1) >= 10000:
+                        return (r, c)
+
+    # ==========================================
+    # ⚖️ 第五段：常规算分拉扯
+    # ==========================================
     for r in range(15):
         for c in range(15):
             if board_state[r, c] == 0:
                 score = 0
                 for dr, dc in directions:
+                    # 进攻与防守权重回归理性
                     score += evaluate_line(board_state, r, c, dr, dc, 2) * 1.0
                     score += evaluate_line(board_state, r, c, dr, dc, 1) * 1.2
+
+                # 偏好棋盘中心
                 score += (7 - abs(7 - r)) + (7 - abs(7 - c))
+
                 if score > best_score:
                     best_score = score
                     best_move = (r, c)
+
     return best_move
 
 
