@@ -2,20 +2,44 @@ import cv2
 import numpy as np
 import requests
 import os
-
+import threading
 import subprocess  # ⬅️ 新增：用于调用系统语音引擎
+import sys
 
 # 强制直连，绕过系统网络代理，防止请求 Ollama 失败
 os.environ['NO_PROXY'] = 'localhost,127.0.0.1,::1'
 
-# ==========================================
-# 🔊 新增：异步语音播报器官
-# ==========================================
+
+def play_edge_tts_thread(text):
+    """真正在后台执行合成和播放的任务"""
+    try:
+        voice = "zh-CN-XiaoyiNeural"
+        output_file = "current_taunt.mp3"
+
+        # 1. 核心修复：用 sys.executable 和 -m 直接从当前 Python 环境里揪出 edge_tts 模块！
+        # 注意模块名是下划线 edge_tts
+        subprocess.run([
+            sys.executable, '-m', 'edge_tts',
+            '--voice', voice,
+            '--rate=+15%',
+            '--text', text,
+            '--write-media', output_file
+        ], check=True)
+
+        # 2. 调用 macOS 原生播放器后台播放
+        subprocess.run(['afplay', output_file])
+
+    except Exception as e:
+        print(f"⚠️ edge-tts 播报异常: {e}")
+
+
 def speak_taunt(text):
-    """调用 macOS 原生系统语音，异步播报，绝不卡顿画面"""
-    # 只要你的蓝牙音响连着 Mac，声音就会自动从音响出来
-    # 你可以把 Ting-Ting 换成别的内置声音，比如 'Mei-Jia' 或 'Sin-ji'
-    subprocess.Popen(['say', '-v', 'Ting-Ting', text])
+    """
+    异步触发器：每次被调用时，开一个新的幽灵线程去执行语音。
+    主程序（OpenCV画面）不需要等它说完，直接继续往下跑。
+    """
+    # daemon=True 保证如果你关掉主程序，语音也会立刻跟着停掉，不会变成幽灵声音
+    threading.Thread(target=play_edge_tts_thread, args=(text,), daemon=True).start()
 
 def order_points(pts):
     """辅助函数：将识别到的棋盘四个顶点按【左上, 右上, 右下, 左下】顺序排列"""
@@ -120,6 +144,47 @@ def check_winner(board):
     return 0
 
 
+def check_fatal_threat(board):
+    """鹰眼扫描：寻找必死棋型（活四：两端皆空的四连子）"""
+    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+    for r in range(15):
+        for c in range(15):
+            player = board[r, c]
+            if player != 0:
+                for dr, dc in directions:
+                    count = 1
+                    nr, nc = r + dr, c + dc
+                    while 0 <= nr < 15 and 0 <= nc < 15 and board[nr, nc] == player:
+                        count += 1
+                        nr += dr
+                        nc += dc
+                    # 发现四连子，检查两端是否都没被堵死
+                    if count == 4:
+                        before_r, before_c = r - dr, c - dc
+                        after_r, after_c = nr, nc
+                        if (0 <= before_r < 15 and 0 <= before_c < 15 and board[before_r, before_c] == 0) and \
+                                (0 <= after_r < 15 and 0 <= after_c < 15 and board[after_r, after_c] == 0):
+                            return player  # 返回 1 (黑棋活四) 或 2 (白棋活四)
+    return 0
+
+
+def generate_checkmate_taunt(is_human_threat, model_name="qwen2.5:7b"):
+    """大模型专属：绝杀前的提前嘲讽"""
+    if is_human_threat:
+        prompt = "你是一个狂妄的五子棋AI，人类刚刚走出了'活四'（必赢棋型）。你即将输掉比赛，请用15个字以内找个极其荒谬的借口，死不承认自己被看穿。"
+    else:
+        prompt = "你是一个狂妄的五子棋AI，你刚刚走出了'活四'（必赢棋型）。请用15个字以内极其嚣张地让对方立刻投降。"
+
+    url = "http://127.0.0.1:11434/api/generate"
+    payload = {"model": model_name, "prompt": prompt, "stream": False}
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            return response.json().get("response", "").strip()
+    except:
+        pass
+    return "算你狠，我的主板刚刚进水了！" if is_human_threat else "放弃挣扎吧，你已经是一具尸体了！"
+
 # ==========================================
 # 🗣️ 嘴替大脑：Qwen 本地大模型调用
 # ==========================================
@@ -179,6 +244,7 @@ stable_frames = 0
 ai_planned_move = None
 is_initialized = False
 game_over = False
+fatal_warned = False    # ⬅️ 新增：赛点预警锁
 
 # 完美打光下的终极 HSV 颜色阈值
 lower_black = np.array([0, 0, 0])
@@ -281,10 +347,12 @@ while True:
                                 print("🎉 比赛结束！人类连成5子，完成绝杀！")
                                 taunt = generate_endgame_taunt(is_human_win=True)
                                 print(f"🤖 AI 破防遗言: {taunt}")
+                                speak_taunt(taunt)  # ⬅️ 插入这一行：气急败坏地狡辩
                             elif winner == 2:
                                 print("💀 比赛结束！AI 连成5子，人类被无情碾压！")
                                 taunt = generate_endgame_taunt(is_human_win=False)
                                 print(f"🤖 AI 胜利宣言: {taunt}")
+                                speak_taunt(taunt)  # ⬅️ 插入这一行：嚣张宣判
                             print("=" * 40)
 
                         # 3. 严格校验：防手影，触发 AI 反击
@@ -314,6 +382,7 @@ while True:
                                     print("-" * 40)
                                     print(f"♟️ 电脑绝对理性落子: {ai_planned_move}")
                                     print(f"🤖 嘲讽: {taunt}")
+                                    speak_taunt(taunt)  # ⬅️ 插入这一行：实况播报
                                     print("-" * 40)
                             else:
                                 print(f"\n[视觉系统] ⚠️ 忽略视觉干扰 (疑似手影遮挡)。")
