@@ -234,10 +234,64 @@ def generate_endgame_taunt(is_human_win):
         return call_ollama("你是一个傲娇的五子棋少女，你连成5子碾压了人类。发表终极胜利宣言。",
                            fallback="这就是惹怒本小姐的下场！")
 
+# ==========================================
+# 📍 核心新增：AI落点校验拦截器
+# ==========================================
+def check_pos(detected_pos, target_pos, error_voice_played):
+    """
+    校验物理落子是否与系统期望位置一致
+    """
+    if detected_pos is None or target_pos is None:
+        return False, error_voice_played
+
+    if detected_pos != target_pos:
+        print(f"❌ 警告：识别落点 {detected_pos} 与目标 {target_pos} 不符！")
+        if not error_voice_played:
+            error_text = "喂！你是不是眼花啦？我让你下在红圈那里，你放哪去了！赶紧给我拿开重新放！"
+            print(f"🤖 少女AI: {error_text}")
+            speak_taunt(error_text)
+        return False, True
+    else:
+        print("✅ 确认落子位置完全一致！")
+        return True, False
+
+# ==========================================
+# 🖱️ 核心新增：动态拾色器 (鼠标回调状态机)
+# ==========================================
+def mouse_callback(event, x, y, flags, param):
+    global calibration_mode, lower_black, upper_black, lower_white, upper_white, hsv_frame_for_picker
+
+    # 只响应左键按下，并且处于校准模式，同时确保点击在棋盘有效区域内(600x600)
+    if event == cv2.EVENT_LBUTTONDOWN and calibration_mode > 0:
+        if hsv_frame_for_picker is not None and y < 600 and x < 600:
+            h, s, v = hsv_frame_for_picker[y, x]
+            print(f"[*] 鼠标拾取像素 HSV: ({h}, {s}, {v})")
+
+            if calibration_mode == 1:
+                # 智能黑棋阈值推算：黑棋核心特征是“亮度低(V小)”，色相H和饱和度S可放宽
+                lower_black = np.array([0, 0, 0])
+                upper_black = np.array([180, 255, min(255, int(v + 40))])
+                print(f"✅ 黑棋阈值更新: {lower_black} -> {upper_black}")
+
+                calibration_mode = 2
+                speak_taunt("黑棋记住了。现在请在画面上点击一颗白棋！")
+
+            elif calibration_mode == 2:
+                # 智能白棋阈值推算：白棋核心特征是“亮度高(V大)，饱和度低(S小)”
+                lower_white = np.array([0, 0, max(0, int(v - 40))])
+                upper_white = np.array([180, min(255, int(s + 40)), 255])
+                print(f"✅ 白棋阈值更新: {lower_white} -> {upper_white}")
+
+                calibration_mode = 0
+                speak_taunt("色彩校准完成，本小姐的眼睛现在可是雪亮的！")
 
 # ================== 主程序启动 ==================
 cap = cv2.VideoCapture(0)
 print("==== 赛博五子棋少女 已启动 ====")
+
+# 🚀 核心新增：提前创建窗口，并绑定鼠标回调钩子
+cv2.namedWindow("Cyber Gomoku Master")
+cv2.setMouseCallback("Cyber Gomoku Master", mouse_callback)
 
 lower_black, upper_black = np.array([0, 0, 0]), np.array([180, 255, 60])
 lower_white, upper_white = np.array([0, 0, 200]), np.array([180, 40, 255])
@@ -249,9 +303,13 @@ ai_planned_move = None
 game_over = False
 fatal_warned = False
 last_valid_M = None
+winner = 0
 
-# 🚀 终极防卡死：盘面记忆矩阵
+# 新增的状态记忆变量
 last_calculated_board = None
+error_voice_played = False
+calibration_mode = 0         # 🚀 0: 关闭, 1: 采黑棋, 2: 采白棋
+hsv_frame_for_picker = None  # 🚀 用于存储当前帧的 HSV 图像供鼠标回调读取
 
 while True:
     ret, frame = cap.read()
@@ -282,6 +340,9 @@ while True:
     warped = cv2.warpPerspective(frame, last_valid_M, (600, 600))
     hsv_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
 
+    # 🚀 核心新增：实时更新供拾色器读取的 HSV 画面
+    hsv_frame_for_picker = hsv_warped.copy()
+
     step = 599.0 / 14
     board_state = np.zeros((15, 15), dtype=int)
     current_black = 0
@@ -307,7 +368,8 @@ while True:
             else:
                 cv2.circle(warped, (x, y), 1, (255, 0, 0), -1)
 
-    if not game_over:
+    # 🚀 核心修改：增加对 calibration_mode 的冻结判定。校准时大脑暂停思考！
+    if not game_over and calibration_mode == 0:
         if current_black != target_black or current_white != target_white:
             target_black = current_black
             target_white = current_white
@@ -336,8 +398,30 @@ while True:
                         cv2.imshow("Cyber Gomoku Master", temp_disp)
                         cv2.waitKey(1)
 
+                # ==========================================
+                # 🚀 新增：拦截与重算逻辑
+                # ==========================================
                 if target_black == target_white:
                     if ai_planned_move is not None:
+                        # 寻找新放下的白子坐标
+                        new_white_pos = None
+                        if last_calculated_board is not None:
+                            diff = board_state - last_calculated_board
+                            new_y, new_x = np.where(diff == 2)
+                            if len(new_y) > 0:
+                                new_white_pos = (new_y[0], new_x[0])
+
+                        # 校验刚才下的这颗白棋是不是目标位置
+                        if new_white_pos is not None:
+                            is_valid, error_voice_played = check_pos(new_white_pos, ai_planned_move, error_voice_played)
+
+                            if not is_valid:
+                                # 🛑 拦截生效！把计分板退回去，假装没看见这颗错的棋子
+                                target_white -= 1
+                                stable_frames = 0
+                                continue  # 跳过本帧后续处理
+
+                        # 下对了，放行
                         print(f"\n[系统] ✅ 确认白棋落子！红圈清除。")
                         ai_planned_move = None
                         last_calculated_board = None  # 顺手把记忆也清了
@@ -373,24 +457,34 @@ while True:
     # ==========================================
     display_img = cv2.copyMakeBorder(warped, 0, 60, 0, 0, cv2.BORDER_CONSTANT, value=(30, 30, 30))
 
-    # 🚀 核心修复：加入对游戏结束状态的 UI 拦截
-    if game_over:
-        cv2.putText(display_img, "GAME OVER! AI WINS!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
-    else:
-        # 只有游戏没结束，才显示轮到谁下棋
-        if target_black == target_white:
-            cv2.putText(display_img, "YOUR TURN: Place Black", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 255, 0), 2)
-        elif target_black == target_white + 1:
-            cv2.putText(display_img, "AI TURN: Place White", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 165, 255), 2)
+    # 🚀 已修复：整合 UI 拦截，确保在同一坐标上只有一条判定生效
+    if calibration_mode == 1:
+        cv2.putText(display_img, "CALIBRATION: Click a BLACK stone", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7,
+                    (0, 255, 255), 2)
+    elif calibration_mode == 2:
+        cv2.putText(display_img, "CALIBRATION: Click a WHITE stone", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7,
+                    (0, 255, 255), 2)
+    elif game_over:
+        if winner == 2:
+            cv2.putText(display_img, "GAME OVER! AI WINS!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+        elif winner == 1:
+            cv2.putText(display_img, "GAME OVER! YOU WIN!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
         else:
-            cv2.putText(display_img, "ERROR: Pieces Mismatch!", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 0, 255), 2)
+            cv2.putText(display_img, "GAME OVER! DRAW!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+    else:
+        if target_black == target_white:
+            cv2.putText(display_img, "YOUR TURN: Place Black", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        elif target_black == target_white + 1:
+            cv2.putText(display_img, "AI TURN: Place White", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        else:
+            cv2.putText(display_img, "ERROR: Pieces Mismatch!", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255),
+                        2)
 
     # 右下角的状态提示也同步修补
     if game_over:
         cv2.putText(display_img, "FINISHED", (480, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    elif calibration_mode > 0:
+        cv2.putText(display_img, "LOCKED", (480, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     elif stable_frames < 15:
         cv2.putText(display_img, f"Wait... {stable_frames}/15", (420, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 165, 255), 2)
@@ -399,7 +493,29 @@ while True:
 
     cv2.imshow("Cyber Gomoku Master", display_img)
 
-    if cv2.waitKey(1) == ord('q'): break
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('r'):
+        print("=== 🔄 收到重置指令，棋局已重置！ ===")
+        restart_text = "哼，这就急着重新开始啦？本小姐就大发慈悲再给你一次机会，准备好再被我虐一次了吗？"
+        print(f"🤖 少女AI: {restart_text}")
+        speak_taunt(restart_text)
+
+        game_over = False
+        winner = 0
+        board_state = np.zeros((15, 15), dtype=int)
+
+        last_calculated_board = None
+        ai_planned_move = None
+        error_voice_played = False
+    # 🚀 核心新增：按 'c' 键触发拾色器
+    elif key == ord('c'):
+        print("=== 🖱️ 进入色彩校准模式 ===")
+        calibration_mode = 1
+        calibration_text = "想要帮我矫正视力吗？请用鼠标在画面上点击一颗黑棋。"
+        print(f"🤖 少女AI: {calibration_text}")
+        speak_taunt(calibration_text)
 
 cap.release()
 cv2.destroyAllWindows()
