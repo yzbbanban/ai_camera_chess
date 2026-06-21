@@ -15,7 +15,7 @@ import requests
 os.environ['NO_PROXY'] = 'localhost,127.0.0.1,::1'
 
 VOICE_NAME = "zh-CN-XiaoyiNeural"  # 晓伊：可爱傲娇的少女音
-TTS_OUTPUT_FILE = "current_taunt.mp3"
+TTS_OUTPUT_FILE = "../current_taunt.mp3"
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5:7b"
 

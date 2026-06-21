@@ -74,6 +74,11 @@ def draw_dashboard(warped, vision, game):
 def handle_settled_frame(board_state, vision, game, human_latest_move, warped):
     """棋子数量已经稳定满 15 帧时，真正做一次判定 + 决策。"""
 
+    # 🔍 调试：打印算法实际看到的棋盘，跟实拍照片核对
+    print("==== 当前算法看到的棋盘 ====")
+    for row in board_state:
+        print("".join("." if v == 0 else ("●" if v == 1 else "○") for v in row))
+
     winner = game.check_game_over(board_state)
     if winner != 0:
         taunt = generate_endgame_taunt(winner == 1)
@@ -112,6 +117,10 @@ def handle_settled_frame(board_state, vision, game, human_latest_move, warped):
 
             move = get_best_move(board_state)
             game.set_ai_move(board_state, move)
+
+            from engine import evaluate_position
+            print(f"🔍 AI选点 {move} | 对AI价值: {evaluate_position(board_state, move[0], move[1], 2)} "
+                  f"| 对人类价值: {evaluate_position(board_state, move[0], move[1], 1)}")
 
             taunt = generate_taunt(human_latest_move, move)
             print(f"♟️ AI指令: 将白棋放在 {move}\n🤖: {taunt}")
