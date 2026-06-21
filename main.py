@@ -1,147 +1,177 @@
+"""
+main.py —— 赛博五子棋少女 主程序
+
+只负责"串流程"：读摄像头 -> 识别棋盘 -> 喂给对局状态机判断该谁走 ->
+该 AI 走时调用 engine 算一步 -> 画面上标红圈 -> 该说话时调用 voice。
+
+具体怎么识别棋盘看 vision.py，怎么算棋看 engine.py，
+对局状态怎么流转看 game.py。
+"""
+
 import cv2
-import numpy as np
+
+from engine import get_best_move
+from game import GomokuGame
+from vision import BoardVision
+from voice import (
+    speak_taunt,
+    generate_taunt,
+    generate_checkmate_taunt,
+    generate_endgame_taunt,
+)
+
+WINDOW_NAME = "Cyber Gomoku Master"
 
 
-# 辅助函数：将识别到的四个点按【左上, 右上, 右下, 左下】的顺序排列
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    # 按行求和 (x+y)：最小的是左上角，最大的是右下角
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    # 按行求差 (y-x)：最小的是右上角，最大的是左下角
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
+def draw_ai_target(display_img, vision, move):
+    """在棋盘上画出 AI 让人类帮忙落子的位置（红圈+十字）。"""
+    r, c = move
+    x, y = vision.grid_to_pixel(r, c)
+    cv2.circle(display_img, (x, y), 14, (0, 0, 255), 2)
+    cv2.line(display_img, (x - 10, y), (x + 10, y), (0, 0, 255), 2)
+    cv2.line(display_img, (x, y - 10), (x, y + 10), (0, 0, 255), 2)
+    cv2.putText(display_img, "PLACE WHITE", (x + 15, y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
 
-cap = cv2.VideoCapture(0)
+def draw_dashboard(warped, vision, game):
+    """底部状态栏：当前轮到谁、识别是否稳定、校准提示等。"""
+    display_img = cv2.copyMakeBorder(warped, 0, 60, 0, 0, cv2.BORDER_CONSTANT, value=(30, 30, 30))
 
-if not cap.isOpened():
-    print("无法打开摄像头！")
-    exit()
+    if vision.calibration_mode == 1:
+        cv2.putText(display_img, "CALIBRATION: Click a BLACK stone", (15, 635),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+    elif vision.calibration_mode == 2:
+        cv2.putText(display_img, "CALIBRATION: Click a WHITE stone", (15, 635),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+    elif game.game_over:
+        if game.winner == 2:
+            cv2.putText(display_img, "GAME OVER! AI WINS!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+        elif game.winner == 1:
+            cv2.putText(display_img, "GAME OVER! YOU WIN!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            cv2.putText(display_img, "GAME OVER! DRAW!", (15, 635), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+    elif game.is_human_turn_settled:
+        cv2.putText(display_img, "YOUR TURN: Place Black", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    elif game.is_ai_turn:
+        cv2.putText(display_img, "AI TURN: Place White", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    else:
+        cv2.putText(display_img, "ERROR: Pieces Mismatch!", (15, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-print("按下 'q' 键退出")
+    if game.game_over:
+        cv2.putText(display_img, "FINISHED", (480, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    elif vision.calibration_mode > 0:
+        cv2.putText(display_img, "LOCKED", (480, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    elif game.stable_frames < 15:
+        cv2.putText(display_img, f"Wait... {game.stable_frames}/15", (420, 635),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    else:
+        cv2.putText(display_img, "READY", (480, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    return display_img
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def handle_settled_frame(board_state, vision, game, human_latest_move, warped):
+    """棋子数量已经稳定满 15 帧时，真正做一次判定 + 决策。"""
 
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        epsilon = 0.02 * cv2.arcLength(largest_contour, True)
-        approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+    winner = game.check_game_over(board_state)
+    if winner != 0:
+        taunt = generate_endgame_taunt(winner == 1)
+        print(f"\n🎉 比赛结束！\n🤖 少女AI: {taunt}")
+        speak_taunt(taunt)
+        return
 
-        if len(approx) == 4:
-            # 画出边框和顶点
-            cv2.drawContours(frame, [approx], -1, (0, 255, 0), 2)
-            for point in approx:
-                x, y = point[0]
-                cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
+    threat = game.check_fatal(board_state)
+    if threat != 0:
+        taunt = generate_checkmate_taunt(threat == 1)
+        print(f"\n🚨 活四预警！\n🤖 少女AI: {taunt}")
+        speak_taunt(taunt)
+        cv2.putText(warped, "CHECKMATE!", (150, 250), cv2.FONT_HERSHEY_DUPLEX, 1.5, (0, 0, 255), 3)
+        temp_disp = cv2.copyMakeBorder(warped, 0, 60, 0, 0, cv2.BORDER_CONSTANT, value=(30, 30, 30))
+        cv2.imshow(WINDOW_NAME, temp_disp)
+        cv2.waitKey(1)
 
-            # --- 新增：透视变换 ---
-            # 1. 提取四个顶点并排序
-            pts = approx.reshape(4, 2)
-            rect = order_points(pts)
+    if game.is_human_turn_settled:
+        if game.ai_planned_move is not None:
+            should_skip, _, should_speak_error = game.validate_ai_stone(board_state)
+            if should_skip:
+                if should_speak_error:
+                    error_text = "喂！你是不是眼花啦？我让你下在红圈那里，你放哪去了！赶紧给我拿开重新放！"
+                    print(f"🤖 少女AI: {error_text}")
+                    speak_taunt(error_text)
+                return
+            print("\n[系统] ✅ 确认白棋落子！红圈清除。")
 
-            # 2. 设定目标画面的大小，五子棋通常是 15x15 线条，设个好除以 14 的数字，比如 600x600 像素
-            dst = np.array([
-                [0, 0],
-                [599, 0],
-                [599, 599],
-                [0, 599]
-            ], dtype="float32")
+    elif game.is_ai_turn:
+        if game.needs_recalculation(board_state):
+            print("\n[系统] 🎯 检测到全新盘面！AI开始思考...")
+            cv2.putText(warped, "AI THINKING...", (120, 300), cv2.FONT_HERSHEY_DUPLEX, 1.5, (0, 0, 255), 3)
+            temp_disp = cv2.copyMakeBorder(warped, 0, 60, 0, 0, cv2.BORDER_CONSTANT, value=(30, 30, 30))
+            cv2.imshow(WINDOW_NAME, temp_disp)
+            cv2.waitKey(1)
 
-            # 3. 计算透视变换矩阵并生成新图像
-            M = cv2.getPerspectiveTransform(rect, dst)
-            warped = cv2.warpPerspective(frame, M, (600, 600))
+            move = get_best_move(board_state)
+            game.set_ai_move(board_state, move)
 
-            hsv_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+            taunt = generate_taunt(human_latest_move, move)
+            print(f"♟️ AI指令: 将白棋放在 {move}\n🤖: {taunt}")
+            speak_taunt(taunt)
 
-            # 建立 15x15 虚拟坐标网格 (已有的代码)
-            grid_size = 15
-            step = 599.0 / (grid_size - 1)
 
-            # --- 新增：定义棋子HSV阈值 (需要根据你的光线调优) ---
-            # 黑棋：低亮度 (V值是关键，V < 50)
-            lower_black = np.array([0, 0, 0])
-            upper_black = np.array([180, 255, 60])
+def main():
+    cap = cv2.VideoCapture(0)
+    print("==== 赛博五子棋少女 已启动 ====")
 
-            # 白棋：高亮度 (V > 180)，且低饱和度 (S < 40，过滤黄色的木头色)
-            lower_white = np.array([0, 0, 200])
-            upper_white = np.array([180, 40, 255])
+    vision = BoardVision(board_size=15)
+    game = GomokuGame()
 
-            # 准备一个 15x15 的二维数组存棋局状态 (0:空, 1:黑, 2:白)
-            # 你可以把它当成虚拟的五子棋程序
-            board_state = np.zeros((15, 15), dtype=int)
+    cv2.namedWindow(WINDOW_NAME)
+    cv2.setMouseCallback(WINDOW_NAME, vision.mouse_callback)
 
-            # 设定ROI（感兴趣区域）检测方块的大小 (在每个交叉点周围10x10像素)
-            roi_size = 12
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            # 核心检测循环
-            for row in range(grid_size):
-                for col in range(grid_size):
-                    # 计算每个交叉点的 x 和 y 像素坐标 (已有的代码)
-                    x = int(round(col * step))
-                    y = int(round(row * step))
+        vision.find_board(frame)
+        if not vision.has_board():
+            cv2.putText(frame, "Looking for Gomoku Board...", (50, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            cv2.imshow(WINDOW_NAME, frame)
+            if cv2.waitKey(1) == ord('q'):
+                break
+            continue
 
-                    # 裁剪出该交叉点周围的一个小方块 (ROI)
-                    y_start = max(0, y - roi_size)
-                    y_end = min(599, y + roi_size)
-                    x_start = max(0, x - roi_size)
-                    x_end = min(599, x + roi_size)
+        warped = vision.warp(frame)
+        board_state, current_black, current_white, human_latest_move, warped = vision.read_board(warped)
 
-                    # 裁剪出的HSV区域
-                    roi_hsv = hsv_warped[y_start:y_end, x_start:x_end]
+        if not game.game_over and vision.calibration_mode == 0:
+            just_settled = game.update_stability(current_black, current_white)
+            if just_settled:
+                handle_settled_frame(board_state, vision, game, human_latest_move, warped)
 
-                    # 应用颜色阈值，生成掩膜 (符合颜色的像素为白，不符合为黑)
-                    mask_black = cv2.inRange(roi_hsv, lower_black, upper_black)
-                    mask_white = cv2.inRange(roi_hsv, lower_white, upper_white)
+        if game.ai_planned_move is not None:
+            draw_ai_target(warped, vision, game.ai_planned_move)
 
-                    # 计算小区域内黑棋和白棋的像素数量
-                    black_pixel_count = cv2.countNonZero(mask_black)
-                    white_pixel_count = cv2.countNonZero(mask_white)
+        display_img = draw_dashboard(warped, vision, game)
+        cv2.imshow(WINDOW_NAME, display_img)
 
-                    # 计算占比 (设定一个门限值，比如超过30%的面积是该颜色)
-                    total_pixels = (roi_size * 2) ** 2
-                    threshold_ratio = 0.4
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('r'):
+            print("=== 🔄 收到重置指令，棋局已重置！ ===")
+            restart_text = "哼，这就急着重新开始啦？本小姐就大发慈悲再给你一次机会，准备好再被我虐一次了吗？"
+            print(f"🤖 少女AI: {restart_text}")
+            speak_taunt(restart_text)
+            game.reset()
+        elif key == ord('c'):
+            print("=== 🖱️ 进入色彩校准模式 ===")
+            vision.start_calibration()
 
-                    # 判定棋子类型
-                    if black_pixel_count / total_pixels > threshold_ratio:
-                        board_state[row, col] = 1  # 黑
-                        # 在拉平的棋盘上画一个粗黑圈
-                        cv2.circle(warped, (x, y), 8, (0, 0, 0), 3)
-                    elif white_pixel_count / total_pixels > threshold_ratio:
-                        board_state[row, col] = 2  # 白
-                        # 在拉平的棋盘上画一个粗白圈
-                        cv2.circle(warped, (x, y), 8, (255, 255, 255), 3)
-                    else:
-                        board_state[row, col] = 0  # 空
-                        # 保持小蓝点，画得更小一点
-                        cv2.circle(warped, (x, y), 1, (255, 0, 0), -1)
+    cap.release()
+    cv2.destroyAllWindows()
 
-                        # 可选：如果你想看到目前的HSV图像（比如白棋掩膜）可以取消注释
-            # cv2.imshow("HSV White Mask (Debug)", mask_white)
 
-            # --- 新增：全局颜色掩膜调试窗口 ---
-            full_mask_white = cv2.inRange(hsv_warped, lower_white, upper_white)
-            full_mask_black = cv2.inRange(hsv_warped, lower_black, upper_black)
-            cv2.imshow("Debug: White Vision", full_mask_white)
-            cv2.imshow("Debug: Black Vision", full_mask_black)
-
-            # 显示结果
-            cv2.imshow("Warped Board (Chess Recognition Enabled)", warped)
-
-    if cv2.waitKey(1) == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
