@@ -9,6 +9,29 @@ import sys
 # 强制直连
 os.environ['NO_PROXY'] = 'localhost,127.0.0.1,::1'
 
+# ==========================================
+# 棋形编码表（互不冲突，可安全用于 shape_counts 统计）
+# ==========================================
+PATTERN_FIVE = 5  # 连五
+PATTERN_OPEN_FOUR = 42  # 活四（两端都空，必杀）
+PATTERN_FOUR = 41  # 冲四（单端空，必须挡）
+PATTERN_OPEN_THREE = 32  # 活三（两端都空）
+PATTERN_BLOCKED_THREE = 31  # 眠三（单端空）
+PATTERN_OPEN_TWO = 22
+PATTERN_BLOCKED_TWO = 21
+PATTERN_NONE = 0
+
+_PATTERN_SCORE = {
+    PATTERN_FIVE: 100000,
+    PATTERN_OPEN_FOUR: 10000,
+    PATTERN_FOUR: 1000,
+    PATTERN_OPEN_THREE: 800,  # 注意：刻意比冲四(1000)低一档，避免和冲四混淆权重
+    PATTERN_BLOCKED_THREE: 100,
+    PATTERN_OPEN_TWO: 80,
+    PATTERN_BLOCKED_TWO: 10,
+    PATTERN_NONE: 0,
+}
+
 
 # ==========================================
 # 🔊 异步后台发声器官 (Edge-TTS)
@@ -60,6 +83,10 @@ def order_points(pts):
 # 🧠 传统小脑：算力引擎与鹰眼
 # ==========================================
 def evaluate_line(board, r, c, dr, dc, player):
+    """
+    评估一个方向上的棋形，返回 (pattern_code, score)
+    pattern_code 唯一对应一种棋形，不会和其他棋形撞车
+    """
     count = 1
     i, j = r + dr, c + dc
     space1 = 0
@@ -67,94 +94,220 @@ def evaluate_line(board, r, c, dr, dc, player):
         if board[i, j] == player:
             count += 1
         elif board[i, j] == 0:
-            space1 = 1; break
+            space1 = 1;
+            break
         else:
             break
         i, j = i + dr, j + dc
+
     i, j = r - dr, c - dc
     space2 = 0
     while 0 <= i < 15 and 0 <= j < 15:
         if board[i, j] == player:
             count += 1
         elif board[i, j] == 0:
-            space2 = 1; break
+            space2 = 1;
+            break
         else:
             break
         i, j = i - dr, j - dc
+
     spaces = space1 + space2
-    if count >= 5: return 100000
-    if count == 4 and spaces == 2: return 10000
-    if count == 4 and spaces == 1: return 1000
-    if count == 3 and spaces == 2: return 1000
-    if count == 3 and spaces == 1: return 100
-    if count == 2 and spaces == 2: return 100
-    if count == 2 and spaces == 1: return 10
-    return 0
+
+    if count >= 5:
+        pattern = PATTERN_FIVE
+    elif count == 4 and spaces == 2:
+        pattern = PATTERN_OPEN_FOUR
+    elif count == 4 and spaces == 1:
+        pattern = PATTERN_FOUR
+    elif count == 3 and spaces == 2:
+        pattern = PATTERN_OPEN_THREE
+    elif count == 3 and spaces == 1:
+        pattern = PATTERN_BLOCKED_THREE
+    elif count == 2 and spaces == 2:
+        pattern = PATTERN_OPEN_TWO
+    elif count == 2 and spaces == 1:
+        pattern = PATTERN_BLOCKED_TWO
+    else:
+        pattern = PATTERN_NONE
+
+    return pattern, _PATTERN_SCORE[pattern]
+
+
+def evaluate_position(board, r, c, player):
+    """
+    评估某个空位对 player 的价值，含连环套(fork)识别。
+    修复点：shape_counts 现在按 pattern_code 统计，不会再和别的棋形分数撞车。
+    """
+    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+    total_score = 0
+    shape_counts = {
+        PATTERN_FIVE: 0, PATTERN_OPEN_FOUR: 0, PATTERN_FOUR: 0,
+        PATTERN_OPEN_THREE: 0, PATTERN_BLOCKED_THREE: 0,
+        PATTERN_OPEN_TWO: 0, PATTERN_BLOCKED_TWO: 0,
+        PATTERN_NONE: 0,
+    }
+
+    for dr, dc in directions:
+        pattern, score = evaluate_line(board, r, c, dr, dc, player)
+        shape_counts[pattern] += 1
+        total_score += score
+
+    # 连环套加成：现在四和三不会再互相干扰
+    if shape_counts[PATTERN_FIVE] > 0:
+        total_score += 1000000  # 直接连五，必胜
+    elif shape_counts[PATTERN_OPEN_FOUR] > 0:
+        total_score += 500000  # 活四：对方挡不住，必杀
+    elif shape_counts[PATTERN_FOUR] >= 2:
+        total_score += 400000  # 双冲四：对方只能挡一个
+    elif shape_counts[PATTERN_FOUR] >= 1 and shape_counts[PATTERN_OPEN_THREE] >= 1:
+        total_score += 300000  # 四三连环
+    elif shape_counts[PATTERN_OPEN_THREE] >= 2:
+        total_score += 150000  # 双活三：经典必杀棋形
+    elif shape_counts[PATTERN_FOUR] >= 1:
+        total_score += 50000  # 单冲四：对方必须挡这一手
+
+    return total_score
+
+def has_neighbor(board, r, c, radius=2):
+    for dr in range(-radius, radius + 1):
+        for dc in range(-radius, radius + 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < 15 and 0 <= nc < 15 and board[nr, nc] != 0:
+                return True
+    return False
+
+
+def evaluate_board_total(board):
+    """
+    静态局面评估。
+    修复点：原来只取全局单点最高分，现在改为对每一方取 top-2 威胁点叠加，
+    这样才能识别"对方同时存在两个独立威胁点"的危险局面，而不是只看最大的那一个。
+    """
+    ai_scores = []
+    hu_scores = []
+    for r in range(15):
+        for c in range(15):
+            if board[r, c] == 0 and has_neighbor(board, r, c, 1):
+                ai_scores.append(evaluate_position(board, r, c, 2))
+                hu_scores.append(evaluate_position(board, r, c, 1))
+
+    ai_scores.sort(reverse=True)
+    hu_scores.sort(reverse=True)
+
+    # top-2 叠加（第二威胁点打 0.6 折，近似表示"两个威胁不能同时防"的危险程度）
+    ai_total = ai_scores[0] if ai_scores else 0
+    if len(ai_scores) > 1:
+        ai_total += ai_scores[1] * 0.6
+
+    hu_total = hu_scores[0] if hu_scores else 0
+    if len(hu_scores) > 1:
+        hu_total += hu_scores[1] * 0.6
+
+    return ai_total - hu_total * 1.5
+
+# 🚀 新增：带 Alpha-Beta 剪枝的 Minimax 搜索引擎
+def minimax(board, depth, alpha, beta, is_maximizing):
+    if depth == 0:
+        return evaluate_board_total(board)
+
+    candidates = []
+    for r in range(15):
+        for c in range(15):
+            if board[r, c] == 0 and has_neighbor(board, r, c, 2):
+                ai_score = evaluate_position(board, r, c, 2)
+                hu_score = evaluate_position(board, r, c, 1)
+                if is_maximizing:
+                    if ai_score >= 500000:
+                        return 10000000  # AI发现必胜
+                    candidates.append((ai_score + hu_score, (r, c)))
+                else:
+                    if hu_score >= 500000:
+                        return -10000000  # 人类发现必胜
+                    candidates.append((hu_score + ai_score, (r, c)))
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    top_candidates = [move for score, move in candidates[:8]]
+
+    if not top_candidates:
+        return evaluate_board_total(board)
+
+    if is_maximizing:
+        max_eval = -float('inf')
+        for move in top_candidates:
+            board[move[0], move[1]] = 2
+            ev = minimax(board, depth - 1, alpha, beta, False)
+            board[move[0], move[1]] = 0
+            max_eval = max(max_eval, ev)
+            alpha = max(alpha, ev)
+            if beta <= alpha:
+                break
+        return max_eval
+    else:
+        min_eval = float('inf')
+        for move in top_candidates:
+            board[move[0], move[1]] = 1
+            ev = minimax(board, depth - 1, alpha, beta, True)
+            board[move[0], move[1]] = 0
+            min_eval = min(min_eval, ev)
+            beta = min(beta, ev)
+            if beta <= alpha:
+                break
+        return min_eval
 
 
 def get_best_move(board_state):
-    best_score = -1
-    best_move = (7, 7)
-    directions = [(1, 0), (0, 1), (1, 1), (1, -1)]
+    candidates = []
+    is_empty = True
 
-    # ==========================================
-    # 🗡️ 第一段：自己能连成 5 子，瞬间绝杀！
-    # ==========================================
     for r in range(15):
         for c in range(15):
-            if board_state[r, c] == 0:
-                for dr, dc in directions:
-                    if evaluate_line(board_state, r, c, dr, dc, 2) >= 100000:
-                        return (r, c)
+            if board_state[r, c] != 0:
+                is_empty = False
+            elif has_neighbor(board_state, r, c, 2):
+                ai_score = evaluate_position(board_state, r, c, 2)
+                hu_score = evaluate_position(board_state, r, c, 1)
 
-    # ==========================================
-    # 🛡️ 第二段：人类能连成 5 子，必须死堵！
-    # ==========================================
-    for r in range(15):
-        for c in range(15):
-            if board_state[r, c] == 0:
-                for dr, dc in directions:
-                    if evaluate_line(board_state, r, c, dr, dc, 1) >= 100000:
-                        return (r, c)
+                # 直接必胜：连五或活四，不用往下推演了
+                if ai_score >= 500000:
+                    return (r, c)
+                if hu_score >= 500000:
+                    hu_score += 2000000  # 对方有必杀棋形，优先级拉满，必须死守
 
-    # ==========================================
-    # 🗡️ 第三段：自己能造出“活四”，下回合必赢，果断进攻！(修复的就是这里)
-    # ==========================================
-    for r in range(15):
-        for c in range(15):
-            if board_state[r, c] == 0:
-                for dr, dc in directions:
-                    if evaluate_line(board_state, r, c, dr, dc, 2) >= 10000:
-                        return (r, c)
+                total_score = ai_score + hu_score * 1.2
+                total_score += (7 - abs(7 - r)) + (7 - abs(7 - c))
+                candidates.append((total_score, (r, c)))
 
-    # ==========================================
-    # 🛡️ 第四段：人类能造出“活四”，死堵！
-    # ==========================================
-    for r in range(15):
-        for c in range(15):
-            if board_state[r, c] == 0:
-                for dr, dc in directions:
-                    if evaluate_line(board_state, r, c, dr, dc, 1) >= 10000:
-                        return (r, c)
+    if is_empty:
+        return (7, 7)
 
-    # ==========================================
-    # ⚖️ 第五段：常规算分拉扯
-    # ==========================================
-    for r in range(15):
-        for c in range(15):
-            if board_state[r, c] == 0:
-                score = 0
-                for dr, dc in directions:
-                    # 进攻与防守权重回归理性
-                    score += evaluate_line(board_state, r, c, dr, dc, 2) * 1.0
-                    score += evaluate_line(board_state, r, c, dr, dc, 1) * 1.2
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    if not candidates:
+        return (7, 7)
 
-                # 偏好棋盘中心
-                score += (7 - abs(7 - r)) + (7 - abs(7 - c))
+    best_cand_score, best_cand_move = candidates[0]
+    if best_cand_score >= 2000000:
+        return best_cand_move
 
-                if score > best_score:
-                    best_score = score
-                    best_move = (r, c)
+    # depth=2：AI走一步 -> 人类走一步 -> AI再走一步，比原来的 depth=1 多看一层
+    # 候选数收窄到 10 个以控制耗时（15x15 棋盘上 depth=2 已经比较吃性能）
+    top_candidates = [move for score, move in candidates[:10]]
+    best_move = top_candidates[0]
+    best_val = -float('inf')
+    alpha = -float('inf')
+    beta = float('inf')
+
+    for move in top_candidates:
+        board_state[move[0], move[1]] = 2
+        val = minimax(board_state, depth=2, alpha=alpha, beta=beta, is_maximizing=False)
+        board_state[move[0], move[1]] = 0
+
+        if val > best_val:
+            best_val = val
+            best_move = move
+        alpha = max(alpha, best_val)
 
     return best_move
 
@@ -172,11 +325,17 @@ def check_winner(board):
                         count += 1
                         nr += dr
                         nc += dc
-                    if count >= 5: return player
+                    if count >= 5:
+                        return player
     return 0
 
 
 def check_fatal_threat(board):
+    """
+    修复点：原来要求四子两端都空才报警，等于只在"已经挡不住"的活四时才喊话。
+    现在改成"任一端空"就报警——单边冲四同样是"对方下一步就赢"的紧急局面，
+    必须立刻提示玩家去挡，不能等到两端都开才说。
+    """
     directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
     for r in range(15):
         for c in range(15):
@@ -192,8 +351,11 @@ def check_fatal_threat(board):
                     if count == 4:
                         before_r, before_c = r - dr, c - dc
                         after_r, after_c = nr, nc
-                        if (0 <= before_r < 15 and 0 <= before_c < 15 and board[before_r, before_c] == 0) and \
-                                (0 <= after_r < 15 and 0 <= after_c < 15 and board[after_r, after_c] == 0):
+                        before_open = (0 <= before_r < 15 and 0 <= before_c < 15
+                                       and board[before_r, before_c] == 0)
+                        after_open = (0 <= after_r < 15 and 0 <= after_c < 15
+                                      and board[after_r, after_c] == 0)
+                        if before_open or after_open:   # 原来是 and，现在改成 or
                             return player
     return 0
 
