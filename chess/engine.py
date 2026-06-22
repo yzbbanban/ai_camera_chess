@@ -25,7 +25,7 @@ _PATTERN_SCORE = {
     PATTERN_FIVE: 100000,
     PATTERN_OPEN_FOUR: 10000,
     PATTERN_FOUR: 1000,
-    PATTERN_OPEN_THREE: 800,       # 刻意比冲四(1000)低一档，避免和冲四混淆权重
+    PATTERN_OPEN_THREE: 800,
     PATTERN_BLOCKED_THREE: 100,
     PATTERN_OPEN_TWO: 80,
     PATTERN_BLOCKED_TWO: 10,
@@ -100,23 +100,22 @@ def evaluate_position(board, r, c, player):
         total_score += score
 
     if shape_counts[PATTERN_FIVE] > 0:
-        total_score += 1000000     # 直接连五，必胜
+        total_score += 1000000     # 连五，必胜/必防
     elif shape_counts[PATTERN_OPEN_FOUR] > 0:
-        total_score += 500000      # 活四：对方挡不住，必杀
+        total_score += 500000      # 活四：对方挡不住
     elif shape_counts[PATTERN_FOUR] >= 2:
-        total_score += 400000      # 双冲四：对方只能挡一个
+        total_score += 400000      # 双冲四
     elif shape_counts[PATTERN_FOUR] >= 1 and shape_counts[PATTERN_OPEN_THREE] >= 1:
         total_score += 300000      # 四三连环
     elif shape_counts[PATTERN_OPEN_THREE] >= 2:
-        total_score += 150000      # 双活三：经典必杀棋形
+        total_score += 150000      # 双活三
     elif shape_counts[PATTERN_FOUR] >= 1:
-        total_score += 50000       # 单冲四：对方必须挡这一手
+        total_score += 50000       # 单冲四
 
     return total_score
 
 
 def has_neighbor(board, r, c, radius=2):
-    """(r, c) 附近 radius 范围内是否已有棋子（用于缩小搜索候选范围）。"""
     for dr in range(-radius, radius + 1):
         for dc in range(-radius, radius + 1):
             if dr == 0 and dc == 0:
@@ -128,10 +127,6 @@ def has_neighbor(board, r, c, radius=2):
 
 
 def evaluate_board_total(board):
-    """
-    静态局面评估：对每一方取 top-2 威胁点叠加（第二威胁点打 0.6 折），
-    这样能识别"对方同时存在两个独立威胁点"的危险局面，而不是只看最大的那一个。
-    """
     ai_scores = []
     hu_scores = []
     for r in range(BOARD_SIZE):
@@ -155,7 +150,6 @@ def evaluate_board_total(board):
 
 
 def minimax(board, depth, alpha, beta, is_maximizing):
-    """带 Alpha-Beta 剪枝的 Minimax 搜索。"""
     if depth == 0:
         return evaluate_board_total(board)
 
@@ -165,14 +159,30 @@ def minimax(board, depth, alpha, beta, is_maximizing):
             if board[r, c] == 0 and has_neighbor(board, r, c, 2):
                 ai_score = evaluate_position(board, r, c, 2)
                 hu_score = evaluate_position(board, r, c, 1)
+
+                # 💥 修复短路：在推演树里也要严格遵守绝对优先级！
                 if is_maximizing:
-                    if ai_score >= 500000:
-                        return 10000000  # AI发现必胜
-                    candidates.append((ai_score + hu_score, (r, c)))
+                    if ai_score >= 1000000: return 100000000  # AI 连五
+                    if hu_score >= 1000000:
+                        score = 50000000  # 人类 连五，必须堵
+                    elif ai_score >= 300000:
+                        score = 10000000  # AI 活四/双杀
+                    elif hu_score >= 300000:
+                        score = 5000000   # 人类 活四/双杀
+                    else:
+                        score = ai_score + hu_score
+                    candidates.append((score, (r, c)))
                 else:
-                    if hu_score >= 500000:
-                        return -10000000  # 人类发现必胜
-                    candidates.append((hu_score + ai_score, (r, c)))
+                    if hu_score >= 1000000: return -100000000 # 人类 连五
+                    if ai_score >= 1000000:
+                        score = 50000000  # AI 连五，人类必须堵
+                    elif hu_score >= 300000:
+                        score = 10000000
+                    elif ai_score >= 300000:
+                        score = 5000000
+                    else:
+                        score = hu_score + ai_score
+                    candidates.append((score, (r, c)))
 
     candidates.sort(reverse=True, key=lambda x: x[0])
     top_candidates = [move for score, move in candidates[:8]]
@@ -217,14 +227,21 @@ def get_best_move(board_state):
                 ai_score = evaluate_position(board_state, r, c, 2)
                 hu_score = evaluate_position(board_state, r, c, 1)
 
-                if ai_score >= 500000:
-                    return (r, c)  # 直接必胜，不用往下推演
-                if hu_score >= 500000:
-                    hu_score += 2000000  # 对方有必杀棋形，必须死守
+                # 💥 核心修复：建立不可逾越的绝对阶梯，彻底取代原有的短路 return
+                if ai_score >= 1000000:
+                    score = 100000000  # 1. AI 连五 (必杀)
+                elif hu_score >= 1000000:
+                    score = 50000000   # 2. 玩家 连五 (必防，必须放下手里的一切去堵)
+                elif ai_score >= 300000:
+                    score = 10000000   # 3. AI 成活四/双杀
+                elif hu_score >= 300000:
+                    score = 5000000    # 4. 玩家 成活四/双杀 (必防)
+                else:
+                    # 5. 常规评估，进攻兼顾防守
+                    score = ai_score + hu_score * 1.2
+                    score += (7 - abs(7 - r)) + (7 - abs(7 - c))  # 居中权重
 
-                total_score = ai_score + hu_score * 1.2
-                total_score += (7 - abs(7 - r)) + (7 - abs(7 - c))  # 居中权重
-                candidates.append((total_score, (r, c)))
+                candidates.append((score, (r, c)))
 
     if is_empty:
         return (7, 7)  # 开局占天元
@@ -233,9 +250,10 @@ def get_best_move(board_state):
     if not candidates:
         return (7, 7)
 
+    # 🚀 斩杀线：如果找到了生死攸关的点（自己能赢，或必须防守死亡），直接出手，跳过深推延！
     best_cand_score, best_cand_move = candidates[0]
-    if best_cand_score >= 2000000:
-        return best_cand_move  # 生死攸关的点，不用再推演
+    if best_cand_score >= 5000000:
+        return best_cand_move
 
     top_candidates = [move for score, move in candidates[:10]]
     best_move = top_candidates[0]
